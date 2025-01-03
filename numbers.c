@@ -74,38 +74,79 @@
 #ifdef BENCHMARK
 #   define ASSERT(expr, ...) AIL_UNUSED(expr)
 #else
-#   define ASSERT(expr, goto_label, test_type, fmt, ...) do { \
+#   define ASSERT(expr, test_type, fmt, ...) do { \
         if (!(expr)) { \
-            printf(test_type " failed at " __FILE__ ":" AIL_STR_LINE " '" AIL_STRINGIFY(expr) "':\n"); \
+            printf("%s failed at " __FILE__ ":" AIL_STR_LINE " '" AIL_STRINGIFY(expr) "':\n", test_type); \
             printf("  " fmt "\n", __VA_ARGS__); \
-            goto goto_label; \
+            return false; \
         } \
     } while(0)
 #endif
 
 
+///////////////////
+// Abstract Format Type
+///////////////////
+
+typedef struct { u16 q, r; } DivResult;
+typedef u16 (*fromIntFunc)(i16 num);
+typedef u8  (*fromInt8Func)(i8 num);
+typedef i16 (*toIntFunc)(u16 num);
+typedef u16 (*extendFunc)(u8 num);
+typedef u8  (*truncFunc)(u16 num);
+typedef u16 (*negFunc)(u16 num);
+typedef u16 (*addFunc)(u16 a, u16 b);
+typedef u16 (*subFunc)(u16 a, u16 b);
+typedef u16 (*mulFunc)(u16 a, u16 b);
+typedef DivResult (*divFunc)(u16 a, u16 b);
+
 typedef struct {
-    i16 q, r;
-} DivResult;
+    const char *name;
+    fromIntFunc  fromInt;
+    fromInt8Func fromInt8;
+    toIntFunc    toInt;
+    extendFunc   extend;
+    truncFunc    trunc;
+    negFunc      neg;
+    addFunc      add;
+    subFunc      sub;
+    mulFunc      mul;
+    divFunc      div;
+} IntFormat;
+
+// Utility Function
+i8 intTrunc(i16 x) {
+    return OR(AND(x, 0x7f), SHIFTL(GET_BIT(x, 15), 7));
+}
+
 
 ///////////////////
 // Two's Complement
 ///////////////////
 
-i8 intTrunc(i16 x) {
+u16 twosCompFromInt(i16 num) {
+    return *(u16*)&num; // Just casts the type
+}
+u8 twosCompFromInt8(i8 num) {
+    return *(u8*)&num; // Just casts the type
+}
+i16 twosCompToInt(u16 num) {
+    return *(i16*)&num; // Just casts the type
+}
+u16 twosCompExtend(u8 x) {
+    return SELECT(GET_BIT(x, 7), OR((u16)x, 0xff00), x);
+}
+u8 twosCompTrunc(u16 x) {
     return OR(AND(x, 0x7f), SHIFTL(GET_BIT(x, 15), 7));
 }
-i16 negInt16(i16 x) {
-    return XOR(x, NOT(0)) + 1;
-}
-i8 negInt8(i8 x) {
+u16 twosCompNeg(u16 x) {
     return XOR(x, NOT(0)) + 1;
 }
 
-i16 addInt16(i16 a, i16 b) {
-    AIL_BENCH_PROFILE_START(addInt16);
+u16 twosCompAdd(u16 a, u16 b) {
+    AIL_BENCH_PROFILE_START(twosCompAdd);
     // Ripple Carry Adder
-    i16 res = 0;
+    u16 res = 0;
     u8 c = 0;
     for (int i = 0; i < 16; i++) {
         u8 ab = GET_BIT(a, i);
@@ -113,54 +154,58 @@ i16 addInt16(i16 a, i16 b) {
         res = SET_BIT(res, i, BXOR(ab, bb, c));
         c   = OR(AND(ab, bb), AND(c, BXOR(ab, bb)));
     }
-    AIL_BENCH_PROFILE_END(addInt16);
+    AIL_BENCH_PROFILE_END(twosCompAdd);
     return res;
 }
-i8 addInt8(i8 a, i8 b) {
-    return intTrunc(addInt16((i16)a, (i16)b));
-}
-
-i16 subInt16(i16 a, i16 b) {
+u16 twosCompSub(u16 a, u16 b) {
     // Subtraction is just addition in two's complement ;)
-    return addInt16(a, negInt16(b));
-}
-
-i16 mulInt16(i16 a, i16 b) {
-    AIL_BENCH_PROFILE_START(mulInt16);
-    // Long Multiplication
-    i16 res = 0;
-    for (int i = 0; i < 16; i++) {
-        res = addInt16(res, SWITCH(GET_BIT(b, i), SHIFTL(a, i)));
-    }
-    AIL_BENCH_PROFILE_END(mulInt16);
+    AIL_BENCH_PROFILE_START(twosCompSub);
+    u16 res = twosCompAdd(a, twosCompNeg(b));
+    AIL_BENCH_PROFILE_END(twosCompSub);
     return res;
 }
-
-DivResult fullDivInt16(i16 a, i16 b) {
-    AIL_BENCH_PROFILE_START(divInt16);
+u16 twosCompMul(u16 a, u16 b) {
+    AIL_BENCH_PROFILE_START(twosCompMul);
+    // Long Multiplication
+    u16 res = 0;
+    for (int i = 0; i < 16; i++) {
+        res = twosCompAdd(res, SWITCH(GET_BIT(b, i), SHIFTL(a, i)));
+    }
+    AIL_BENCH_PROFILE_END(twosCompMul);
+    return res;
+}
+DivResult twosCompDiv(u16 a, u16 b) {
+    AIL_BENCH_PROFILE_START(twosCompDiv);
     // Euclidean Division
     u8  an   = BAND(GET_BIT(a, 15), 1);
     u8  bn   = BAND(GET_BIT(b, 15), 1);
-    i16 num  = SELECT(an, negInt16(a), a);
-    i16 den  = SELECT(bn, negInt16(b), b);
-    i16 quot = 0;
-    i16 rem  = num;
+    u16 num  = SELECT(an, twosCompNeg(a), a);
+    u16 den  = SELECT(bn, twosCompNeg(b), b);
+    u16 quot = 0;
+    u16 rem  = num;
     while (rem >= den) {
-        quot = addInt16(quot, 1);
-        rem  = subInt16(rem, den);
+        quot = twosCompAdd(quot, 1);
+        rem  = twosCompSub(rem, den);
     }
-    rem  = SELECT(bn, rem, negInt16(rem));
-    quot = SELECT(BNOT(bn), quot, negInt16(quot));
-    quot = SELECT(BNOT(an), quot, SELECT(rem == 0, negInt16(quot), addInt16(negInt16(quot), -1)));
-    AIL_BENCH_PROFILE_END(divInt16);
+    rem  = SELECT(an, twosCompNeg(rem), rem);
+    quot = SELECT(BXOR(an, bn), twosCompNeg(quot), quot);
+    AIL_BENCH_PROFILE_END(twosCompDiv);
     return (DivResult) { .q = quot, .r = rem };
 }
-i16 divInt16(i16 a, i16 b) {
-    return fullDivInt16(a, b).q;
-}
-i16 remInt16(i16 a, i16 b) {
-    return fullDivInt16(a, b).r;
-}
+
+global IntFormat TwosComplement = {
+    .name = "Two's Complement",
+    .fromInt  = &twosCompFromInt,
+    .fromInt8 = &twosCompFromInt8,
+    .toInt    = &twosCompToInt,
+    .extend   = &twosCompExtend,
+    .trunc    = &twosCompTrunc,
+    .neg = &twosCompNeg,
+    .add = &twosCompAdd,
+    .sub = &twosCompSub,
+    .mul = &twosCompMul,
+    .div = &twosCompDiv,
+};
 
 
 ///////////////////
@@ -169,76 +214,64 @@ i16 remInt16(i16 a, i16 b) {
 
 typedef u8 SignMag8;
 typedef u16 SignMag16;
-typedef struct { SignMag16 q, r; } SignMagDivResult;
 
-i8 intFromSignMag8(SignMag8 num) {
-    u8 pos = SET_BIT(num, 7, 0);
-    return SELECT(GET_BIT(num, 7), negInt8(pos), pos);
-}
-i16 intFromSignMag16(SignMag16 num) {
+i16 signMagToInt(SignMag16 num) {
     u16 pos = SET_BIT(num, 15, 0);
-    return SELECT(GET_BIT(num, 15), negInt16(pos), pos);
+    return SELECT(GET_BIT(num, 15), twosCompNeg(pos), pos);
+}
+SignMag16 signMagFromInt(i16 num) {
+    return SELECT(BNOT(GET_BIT(num, 15)), (num), (SET_BIT(twosCompAdd(NOT(num), 1), 15, 1)));
 }
 SignMag8 signMagFromInt8(i8 num) {
-    return SELECT(BNOT(GET_BIT(num, 7)), (num), (SET_BIT(addInt16(NOT(num), 1), 7, 1)));
+    return SELECT(BNOT(GET_BIT(num, 7)), (num), (SET_BIT(twosCompAdd(NOT(num), 1), 7, 1)));
 }
-SignMag16 signMagFromInt16(i16 num) {
-    return SELECT(BNOT(GET_BIT(num, 15)), (num), (SET_BIT(addInt16(NOT(num), 1), 15, 1)));
-}
-SignMag16 signMagExt(SignMag8 num) {
+SignMag16 signMagExtend(SignMag8 num) {
     return SET_BIT(SET_BIT(num, 7, 0), 15, GET_BIT(num, 7));
 }
 SignMag8 signMagTrunc(SignMag16 num) {
     return SET_BIT(AND(num, 0x7f), 7, GET_BIT(num, 15));
 }
-
-SignMag16 negSignMag16(SignMag16 x) {
+SignMag16 signMagNeg(SignMag16 x) {
     return SET_BIT(x, 15, BNOT(GET_BIT(x, 15)));
 }
-SignMag8 negSignMag8(SignMag8 x) {
-    return SET_BIT(x, 8, BNOT(GET_BIT(x, 8)));
-}
 
-SignMag16 addSignMag16(SignMag16 a, SignMag16 b) {
+SignMag16 signMagAdd(SignMag16 a, SignMag16 b) {
     u16 asign = GET_BIT(a, 15);
     u16 bsign = GET_BIT(b, 15);
     u16 abits = SET_BIT(a, 15, 0);
     u16 bbits = SET_BIT(b, 15, 0);
     u16 res   = OR(
-        SWITCH(AND(asign, bsign),  SET_BIT(addInt16(abits, bbits), 15, 1)),
-        SWITCH(XOR(asign, bsign),  SELECT(abits >= bbits, SET_BIT(subInt16(abits, bbits), 15, asign), SET_BIT(subInt16(bbits, abits), 15, bsign))),
-        SWITCH(BNOR(asign, bsign), addInt16(abits, bbits))
+        SWITCH(AND(asign, bsign),  SET_BIT(twosCompAdd(abits, bbits), 15, 1)),
+        SWITCH(XOR(asign, bsign),  SELECT(abits >= bbits, SET_BIT(twosCompSub(abits, bbits), 15, asign), SET_BIT(twosCompSub(bbits, abits), 15, bsign))),
+        SWITCH(BNOR(asign, bsign), twosCompAdd(abits, bbits))
     );
     return res;
 }
-
-SignMag16 subSignMag16(SignMag16 a, SignMag16 b) {
+SignMag16 signMagSub(SignMag16 a, SignMag16 b) {
     u16 asign = GET_BIT(a, 15);
     u16 bsign = GET_BIT(b, 15);
     u16 abits = SET_BIT(a, 15, 0);
     u16 bbits = SET_BIT(b, 15, 0);
     u16 res   =  OR(
-        SWITCH(AND(asign, bsign),  SELECT(bbits >= abits, (subInt16(bbits, abits)), SET_BIT(subInt16(abits, bbits), 15, 1))),
-        SWITCH(XOR(asign, bsign),  SET_BIT(addInt16(abits, bbits), 15, asign)),
-        SWITCH(BNOR(asign, bsign), SELECT(abits >= bbits, subInt16(abits, bbits), SET_BIT(subInt16(bbits, abits), 15, 1)))
+        SWITCH(AND(asign, bsign),  SELECT(bbits >= abits, (twosCompSub(bbits, abits)), SET_BIT(twosCompSub(abits, bbits), 15, 1))),
+        SWITCH(XOR(asign, bsign),  SET_BIT(twosCompAdd(abits, bbits), 15, asign)),
+        SWITCH(BNOR(asign, bsign), SELECT(abits >= bbits, twosCompSub(abits, bbits), SET_BIT(twosCompSub(bbits, abits), 15, 1)))
     );
     return res;
 }
-
-SignMag16 mulSignMag16(SignMag16 a, SignMag16 b) {
+SignMag16 signMagMul(SignMag16 a, SignMag16 b) {
     u16 asign = GET_BIT(a, 15);
     u16 bsign = GET_BIT(b, 15);
     u16 abits = SET_BIT(a, 15, 0);
     u16 bbits = SET_BIT(b, 15, 0);
     u16 res   =  OR(
-        SWITCH(AND(asign, bsign),  mulInt16(abits, bbits)),
-        SWITCH(BNOR(asign, bsign), mulInt16(abits, bbits)),
-        SWITCH(XOR(asign, bsign),  SET_BIT(mulInt16(abits, bbits), 15, 1))
+        SWITCH(AND(asign, bsign),  twosCompMul(abits, bbits)),
+        SWITCH(BNOR(asign, bsign), twosCompMul(abits, bbits)),
+        SWITCH(XOR(asign, bsign),  SET_BIT(twosCompMul(abits, bbits), 15, 1))
     );
     return res;
 }
-
-SignMagDivResult fullDivSignMag16(SignMag16 a, SignMag16 b) {
+DivResult signMagDiv(SignMag16 a, SignMag16 b) {
     // Euclidean Division
     u16 asign = GET_BIT(a, 15);
     u16 bsign = GET_BIT(b, 15);
@@ -247,19 +280,27 @@ SignMagDivResult fullDivSignMag16(SignMag16 a, SignMag16 b) {
     SignMag16 quot = 0;
     SignMag16 rem  = abits;
     while (rem >= bbits) {
-        quot = addSignMag16(quot, 1);
-        rem  = subSignMag16(rem, bbits);
+        quot = signMagAdd(quot, 1);
+        rem  = signMagSub(rem, bbits);
     }
-    rem  = SELECT(asign, negSignMag16(rem),  rem);
-    quot = SELECT(BXOR(asign, bsign), negSignMag16(quot), quot);
-    return (SignMagDivResult) { .q = quot, .r = rem };
+    rem  = SELECT(asign, signMagNeg(rem),  rem);
+    quot = SELECT(BXOR(asign, bsign), signMagNeg(quot), quot);
+    return (DivResult) { .q = quot, .r = rem };
 }
-SignMag16 divSignMag16(SignMag16 a, SignMag16 b) {
-    return fullDivInt16(a, b).q;
-}
-SignMag16 remSignMag16(SignMag16 a, SignMag16 b) {
-    return fullDivInt16(a, b).r;
-}
+
+global IntFormat SignMagnitude = {
+    .name = "Sign Magnitude",
+    .fromInt  = &signMagFromInt,
+    .fromInt8 = &signMagFromInt8,
+    .toInt    = &signMagToInt,
+    .extend   = &signMagExtend,
+    .trunc    = &signMagTrunc,
+    .neg = &signMagNeg,
+    .add = &signMagAdd,
+    .sub = &signMagSub,
+    .mul = &signMagMul,
+    .div = &signMagDiv,
+};
 
 
 ///////////////////
@@ -268,65 +309,71 @@ SignMag16 remSignMag16(SignMag16 a, SignMag16 b) {
 
 typedef u8 OnesComp8;
 typedef u16 OnesComp16;
-typedef struct { OnesComp16 q, r; } OnesCompDivResult;
 
-i8 intFromOnesComp8(OnesComp8 num) {
-    return SELECT(GET_BIT(num, 7), addInt8(num, 1), num);
+i16 onesCompToInt(OnesComp16 num) {
+    return SELECT(GET_BIT(num, 15), twosCompAdd(num, 1), num);
 }
-i16 intFromOnesComp16(OnesComp16 num) {
-    return SELECT(GET_BIT(num, 15), addInt16(num, 1), num);
+OnesComp16 onesCompFromInt(i16 num) {
+    return SELECT(GET_BIT(num, 15), twosCompAdd(num, -1), num);
 }
 OnesComp8 onesCompFromInt8(i8 num) {
-    return SELECT(GET_BIT(num, 7), addInt8(num, -1), num);
+    return SELECT(GET_BIT(num, 7), twosCompAdd(num, -1), num);
 }
-OnesComp16 onesCompFromInt16(i16 num) {
-    return SELECT(GET_BIT(num, 15), addInt16(num, -1), num);
-}
-OnesComp16 onesCompExt(OnesComp8 num) {
+OnesComp16 onesCompExtend(OnesComp8 num) {
     return SELECT(GET_BIT(num, 7), OR(num, 0xff00), num);
 }
 OnesComp8 onesCompTrunc(OnesComp16 num) {
     return OR(AND(num, 0x7f), SHIFTL(GET_BIT(num, 15), 7));
 }
-
-OnesComp16 negOnesComp16(OnesComp16 x) {
-    return XOR(x, NOT(0));
-}
-OnesComp8 negOnesComp8(OnesComp8 x) {
+OnesComp16 onesCompNeg(OnesComp16 x) {
     return XOR(x, NOT(0));
 }
 
-OnesComp16 addOnesComp16(OnesComp16 a, OnesComp16 b) {
+OnesComp16 onesCompAdd(OnesComp16 a, OnesComp16 b) {
     // Ripple Carry Adder
-    OnesComp16 res = 0;
+    u8 both_neg = AND(GET_BIT(a, 15), GET_BIT(b, 15));
+    a = SWITCH(both_neg, onesCompNeg(a));
+    b = SWITCH(both_neg, onesCompNeg(b));
     u8 c = 0;
     for (int i = 0; i < 16; i++) {
         u8 ab = GET_BIT(a, i);
         u8 bb = GET_BIT(b, i);
-        res = SET_BIT(res, i, BXOR(ab, bb, c));
-        c   = OR(AND(ab, bb), AND(c, OR(ab, bb)));
+        a = SET_BIT(a, i, BXOR(ab, bb, c));
+        c = OR(AND(ab, bb), AND(c, OR(ab, bb)));
     }
-    return res;
+    // for (int i = 0; i < 16; i++) {
+    //     u8 ab = GET_BIT(a, i);
+    //     u8 bb = GET_BIT(b, i);
+    //     a = SET_BIT(a, i, BXOR(ab, bb, c));
+    //     c = OR(AND(ab, bb), AND(c, OR(ab, bb)));
+    // }
+    a = SWITCH(both_neg, onesCompNeg(a));
+    return a;
+}
+OnesComp16 onesCompSub(OnesComp16 a, OnesComp16 b) {
+    return onesCompAdd(a, onesCompNeg(b));
+}
+OnesComp16 onesCompMul(OnesComp16 a, OnesComp16 b) {
+    return twosCompMul(a, b);
+}
+DivResult onesCompDiv(OnesComp16 a, OnesComp16 b) {
+    DivResult res = twosCompDiv(a, b);
+    return (DivResult) { .q = res.q, .r = res.r };
 }
 
-OnesComp16 subOnesComp16(OnesComp16 a, OnesComp16 b) {
-    return addOnesComp16(a, negOnesComp16(b));
-}
-
-OnesComp16 mulOnesComp16(OnesComp16 a, OnesComp16 b) {
-    return mulInt16(a, b);
-}
-
-OnesCompDivResult fullDivOnesComp16(OnesComp16 a, OnesComp16 b) {
-    DivResult res = fullDivInt16(a, b);
-    return (OnesCompDivResult) { .q = res.q, .r = res.r };
-}
-OnesComp16 divOnesComp16(OnesComp16 a, OnesComp16 b) {
-    return fullDivOnesComp16(a, b).q;
-}
-OnesComp16 remOnesComp16(OnesComp16 a, OnesComp16 b) {
-    return fullDivOnesComp16(a, b).r;
-}
+global IntFormat OnesComplement = {
+    .name = "One's Complement",
+    .fromInt  = &onesCompFromInt,
+    .fromInt8 = &onesCompFromInt8,
+    .toInt    = &onesCompToInt,
+    .extend   = &onesCompExtend,
+    .trunc    = &onesCompTrunc,
+    .neg = &onesCompNeg,
+    .add = &onesCompAdd,
+    .sub = &onesCompSub,
+    .mul = &onesCompMul,
+    .div = &onesCompDiv,
+};
 
 
 ///////////////////
@@ -347,140 +394,129 @@ typedef u8 BaseNeg28;  typedef u16 BaseNeg216;
 // Tests
 ///////////////////
 
-#define TEST_CONV(tu, tl) do {                                                                                                                               \
-        AIL_BENCH_PROFILE_START(AIL_CONCAT(test, tu, Conv));                                                                                                 \
-        for (int i = 0; i <= 0xffff; i++) {                                                                                                                  \
-            i16 x = (i16)i;                                                                                                                                  \
-            if (x != (i16)0x8000) {                                                                                                                          \
-                AIL_CONCAT(tu, 16) val16 = AIL_CONCAT(tl, FromInt16)(x);                                                                                     \
-                ASSERT(x == AIL_CONCAT(intFrom, tu, 16)(val16), AIL_CONCAT(tl, ConvFail), AIL_STRINGIFY(tu) "-Conversion",                                   \
-                    "Conversion: %d -> 0x%04x -> %d", x, val16,AIL_CONCAT(intFrom, tu, 16)(val16));                                                          \
-                if (intTrunc(x) != (i8)0x80) {                                                                                                               \
-                    AIL_CONCAT(tu, 8) val8 = AIL_CONCAT(tl, FromInt8)(intTrunc(x));                                                                          \
-                    ASSERT(intTrunc(x) == (i8)0x80 || AIL_CONCAT(tl, Trunc)(val16) == val8, AIL_CONCAT(tl, ConvFail), AIL_STRINGIFY(tu) "-Conversion",       \
-                        "Truncation: %d -> %d (expected %d) | 0x%04x -> 0x%02x (expected 0x%02x)",                                                           \
-                        x, AIL_CONCAT(intFrom, tu, 8)(AIL_CONCAT(tl, Trunc)(val16)), intTrunc(x), val16, AIL_CONCAT(tl, Trunc)(val16), val8);                \
-                    ASSERT(intTrunc(x) == (i8)0x80 || AIL_CONCAT(tl, Ext)(val8) == AIL_CONCAT(tl, FromInt16)(intTrunc(x)),                                   \
-                        AIL_CONCAT(tl, ConvFail), AIL_STRINGIFY(tu) "-Conversion", "Extension: %d -> %d (expected %d) | 0x%04x -> 0x%04x (expected 0x%04x)", \
-                        intTrunc(x), AIL_CONCAT(intFrom, tu, 16)(AIL_CONCAT(tl, Ext)(val8)), intTrunc(x),                                                    \
-                        val8, AIL_CONCAT(tl, Ext)(val8), AIL_CONCAT(tl, FromInt16)(intTrunc(x)));                                                            \
-                }                                                                                                                                            \
-            }                                                                                                                                                \
-        }                                                                                                                                                    \
-        printf(AIL_STRINGIFY(tu) "-Conversion tested successfully\n");                                                                                       \
-    AIL_CONCAT(tl, ConvFail):                                                                                                                                \
-        AIL_BENCH_PROFILE_END(AIL_CONCAT(test, tu, Conv));                                                                                                   \
-    } while(0)
+bool test_conv(IntFormat fmt) {
+    char buf[64];
+    snprintf(buf, ail_arrlen(buf), "%s-Conversion", fmt.name);
+    for (int i = 0; i <= 0xffff; i++) {
+        i16 x = (i16)i;
+        if (x != (i16)0x8000) {
+            u16 val16 = fmt.fromInt(x);
+            ASSERT(x == fmt.toInt(val16), buf, "Conversion: %d -> 0x%04x -> %d", x, val16, fmt.toInt(val16));
+            if (intTrunc(x) != (i8)0x80) {
+                u8 val8 = fmt.fromInt8(intTrunc(x));
+                ASSERT(fmt.trunc(val16) == val8, buf,
+                    "Truncation: %d -> %d (expected %d) | 0x%04x -> 0x%02x (expected 0x%02x)",
+                    x, fmt.toInt(fmt.trunc(val16)), intTrunc(x), val16, fmt.trunc(val16), val8);
+                ASSERT(fmt.extend(val8) == fmt.fromInt((i16)(intTrunc(x))), buf,
+                    "Extension: %d -> %d (expected %d) | 0x%04x -> 0x%04x (expected 0x%04x)",
+                    intTrunc(x), fmt.toInt(fmt.extend(val8)), (u16)((i16)(intTrunc(x))), val8, fmt.extend(val8), fmt.fromInt((i16)(intTrunc(x))));
+            }
+        }
+    }
+    printf("%s tested successfully\n", buf);
+    return true;
+}
 
-#define TEST_NEG(tu, tl) do { \
-        AIL_BENCH_PROFILE_START(AIL_CONCAT(test, tu, Neg)); \
-        for (int i = 0; i <= 0xffff; i++) { \
-            i16 x = (i16)i; \
-            AIL_CONCAT(tu, 16) val = AIL_CONCAT(tl, FromInt16)(x); \
-            ASSERT(val == AIL_CONCAT(neg, tu, 16)(AIL_CONCAT(neg, tu, 16)(val)), AIL_CONCAT(tl, NegFail), AIL_STRINGIFY(tu) "-Negation", \
-                "Negation: 0x%02x -> 0x%02x -> 0x%02x", \
-                val, AIL_CONCAT(neg, tu, 16)(val), AIL_CONCAT(neg, tu, 16)(AIL_CONCAT(neg, tu, 16)(val))); \
-            if (x != 0 && x != (i16)0x8000) { \
-                ASSERT(AIL_CONCAT(tl, FromInt16)(-x) == AIL_CONCAT(neg, tu, 16)(val), AIL_CONCAT(tl, NegFail), AIL_STRINGIFY(tu) "-Negation", \
-                    "%d -> 0x%02x != 0x%02x -> 0x%02x", -x, AIL_CONCAT(tl, FromInt16)(-x), val, AIL_CONCAT(neg, tu, 16)(val)); \
-            } \
-        } \
-        printf(AIL_STRINGIFY(tu) "-Negation tested successfully\n"); \
-    AIL_CONCAT(tl, NegFail): \
-        AIL_BENCH_PROFILE_END(AIL_CONCAT(test, tu, Neg)); \
-    } while(0)
+bool test_neg(IntFormat fmt) {
+    char buf[64];
+    snprintf(buf, ail_arrlen(buf), "%s-Negation", fmt.name);
+    for (int i = 0; i <= 0xffff; i++) {
+        i16 x = (i16)i;
+        u16 val = fmt.fromInt(x);
+        ASSERT(val == fmt.neg(fmt.neg(val)), buf,
+            "Negation: 0x%02x -> 0x%02x -> 0x%02x",
+            val, fmt.neg(val), fmt.neg(fmt.neg(val)));
+        if (x != 0 && x != (i16)0x8000) {
+            ASSERT(fmt.fromInt(-x) == fmt.neg(val), buf, "%d -> 0x%02x != 0x%02x -> 0x%02x", -x, fmt.fromInt(-x), val, fmt.neg(val));
+        }
+    }
+    printf("%s tested successfully\n", buf);
+    return true;
+}
 
-#define TEST_ADD(tu, tl) do { \
-        AIL_BENCH_PROFILE_START(AIL_CONCAT(test, tu, Add)); \
-        for (int i = -128; i <= 128; i++) { \
-            for (int j = -128; j <= 128; j++) { \
-                AIL_CONCAT(tu, 16) a = AIL_CONCAT(tl, FromInt16)(i); \
-                AIL_CONCAT(tu, 16) b = AIL_CONCAT(tl, FromInt16)(j); \
-                i16 expected = AIL_CONCAT(intFrom, tu, 16)(a) + AIL_CONCAT(intFrom, tu, 16)(b); \
-                AIL_CONCAT(tu, 16) res = AIL_CONCAT(add, tu, 16)(a, b); \
-                ASSERT(expected == AIL_CONCAT(intFrom, tu, 16)(res), AIL_CONCAT(tl, AddFail), AIL_STRINGIFY(tu) "-Addition", \
-                    "%d + %d = %d (expected %d) | 0x%02x + 0x%02x = 0x%02x (expected 0x%02x)", \
-                    AIL_CONCAT(intFrom, tu, 16)(a), AIL_CONCAT(intFrom, tu, 16)(b), AIL_CONCAT(intFrom, tu, 16)(res), expected, \
-                    a, b, (u16)res, AIL_CONCAT(tl, FromInt16)(expected)); \
-            } \
-        } \
-        printf(AIL_STRINGIFY(tu) "-Addition tested successfully\n"); \
-    AIL_CONCAT(tl, AddFail): \
-        AIL_BENCH_PROFILE_END(AIL_CONCAT(test, tu, Add)); \
-    } while(0)
+bool test_add(IntFormat fmt) {
+    char buf[64];
+    snprintf(buf, ail_arrlen(buf), "%s-Addition", fmt.name);
+    for (int i = -128; i <= 128; i++) {
+        for (int j = -128; j <= 128; j++) {
+            u16 a = fmt.fromInt(i);
+            u16 b = fmt.fromInt(j);
+            i16 expected = fmt.toInt(a) + fmt.toInt(b);
+            u16 res = fmt.add(a, b);
+            ASSERT(expected == fmt.toInt(res), buf, "%d + %d = %d (expected %d) | 0x%02x + 0x%02x = 0x%02x (expected 0x%02x)",
+                fmt.toInt(a), fmt.toInt(b), fmt.toInt(res), expected, a, b, (u16)res, fmt.fromInt(expected));
+        }
+    }
+    printf("%s tested successfully\n", buf);
+    return true;
+}
 
-#define TEST_SUB(tu, tl) do { \
-        AIL_BENCH_PROFILE_START(AIL_CONCAT(test, tu, Sub)); \
-        for (int i = -128; i <= 128; i++) { \
-            for (int j = -128; j <= 128; j++) { \
-                AIL_CONCAT(tu, 16) a = AIL_CONCAT(tl, FromInt16)(i); \
-                AIL_CONCAT(tu, 16) b = AIL_CONCAT(tl, FromInt16)(j); \
-                i16 expected = AIL_CONCAT(intFrom, tu, 16)(a) - AIL_CONCAT(intFrom, tu, 16)(b); \
-                AIL_CONCAT(tu, 16) res = AIL_CONCAT(sub, tu, 16)(a, b); \
-                ASSERT(expected == AIL_CONCAT(intFrom, tu, 16)(res), AIL_CONCAT(tl, SubFail), AIL_STRINGIFY(tu) "-Subtraction", \
-                    "%d - %d = %d (expected %d) | 0x%02x - 0x%02x = 0x%02x (expected 0x%02x)", \
-                    AIL_CONCAT(intFrom, tu, 16)(a), AIL_CONCAT(intFrom, tu, 16)(b), AIL_CONCAT(intFrom, tu, 16)(res), expected, \
-                    a, b, (u16)res, AIL_CONCAT(tl, FromInt16)(expected)); \
-            } \
-        } \
-        printf(AIL_STRINGIFY(tu) "-Subtraction tested successfully\n"); \
-    AIL_CONCAT(tl, SubFail): \
-        AIL_BENCH_PROFILE_END(AIL_CONCAT(test, tu, Sub)); \
-    } while(0)
+bool test_sub(IntFormat fmt) {
+    char buf[64];
+    snprintf(buf, ail_arrlen(buf), "%s-Subtraction", fmt.name);
+    for (int i = -128; i <= 128; i++) {
+        for (int j = -128; j <= 128; j++) {
+            u16 a = fmt.fromInt(i);
+            u16 b = fmt.fromInt(j);
+            i16 expected = fmt.toInt(a) - fmt.toInt(b);
+            u16 res = fmt.sub(a, b);
+            ASSERT(expected == fmt.toInt(res), buf, "%d - %d = %d (expected %d) | 0x%02x - 0x%02x = 0x%02x (expected 0x%02x)",
+                fmt.toInt(a), fmt.toInt(b), fmt.toInt(res), expected, a, b, (u16)res, fmt.fromInt(expected));
+        }
+    }
+    printf("%s tested successfully\n", buf);
+    return true;
+}
 
-#define TEST_MUL(tu, tl) do { \
-        AIL_BENCH_PROFILE_START(AIL_CONCAT(test, tu, Mul)); \
-        for (int i = -128; i <= 128; i++) { \
-            for (int j = -128; j <= 128; j++) { \
-                AIL_CONCAT(tu, 16) a = AIL_CONCAT(tl, FromInt16)(i); \
-                AIL_CONCAT(tu, 16) b = AIL_CONCAT(tl, FromInt16)(j); \
-                i16 expected = AIL_CONCAT(intFrom, tu, 16)(a) * AIL_CONCAT(intFrom, tu, 16)(b); \
-                AIL_CONCAT(tu, 16) res = AIL_CONCAT(mul, tu, 16)(a, b); \
-                ASSERT(expected == AIL_CONCAT(intFrom, tu, 16)(res), AIL_CONCAT(tl, MulFail), AIL_STRINGIFY(tu) "-Multiplication", \
-                    "%d * %d = %d (expected %d) | 0x%02x * 0x%02x = 0x%02x (expected 0x%02x)", \
-                    AIL_CONCAT(intFrom, tu, 16)(a), AIL_CONCAT(intFrom, tu, 16)(b), AIL_CONCAT(intFrom, tu, 16)(res), expected, \
-                    a, b, (u16)res, AIL_CONCAT(tl, FromInt16)(expected)); \
-            } \
-        } \
-        printf(AIL_STRINGIFY(tu) "-Multiplication tested successfully\n"); \
-    AIL_CONCAT(tl, MulFail): \
-        AIL_BENCH_PROFILE_END(AIL_CONCAT(test, tu, Mul)); \
-    } while(0)
+bool test_mul(IntFormat fmt) {
+    char buf[64];
+    snprintf(buf, ail_arrlen(buf), "%s-Multiplication", fmt.name);
+    for (int i = -128; i <= 128; i++) {
+        for (int j = -128; j <= 128; j++) {
+            u16 a = fmt.fromInt(i);
+            u16 b = fmt.fromInt(j);
+            i16 expected = fmt.toInt(a) * fmt.toInt(b);
+            u16 res = fmt.mul(a, b);
+            ASSERT(expected == fmt.toInt(res), buf, "%d * %d = %d (expected %d) | 0x%02x * 0x%02x = 0x%02x (expected 0x%02x)",
+                fmt.toInt(a), fmt.toInt(b), fmt.toInt(res), expected, a, b, (u16)res, fmt.fromInt(expected));
+        }
+    }
+    printf("%s tested successfully\n", buf);
+    return true;
+}
 
 // @TODO: Add test (quot*b + rem == a)
-#define TEST_DIV(tu, tl) do { \
-        AIL_BENCH_PROFILE_START(AIL_CONCAT(test, tu, Div)); \
-        for (int i = -128; i <= 128; i++) { \
-            for (int j = -128; j <= 128; j++) { \
-                AIL_CONCAT(tu, 16) a = AIL_CONCAT(tl, FromInt16)(i); \
-                AIL_CONCAT(tu, 16) b = AIL_CONCAT(tl, FromInt16)(j); \
-                if (!b) continue; \
-                i16 expectedQ = AIL_CONCAT(intFrom, tu, 16)(a) / AIL_CONCAT(intFrom, tu, 16)(b); \
-                i16 expectedR = AIL_CONCAT(intFrom, tu, 16)(a) % AIL_CONCAT(intFrom, tu, 16)(b); \
-                AIL_CONCAT(tu, DivResult) res = AIL_CONCAT(fullDiv, tu, 16)(a, b); \
-                ASSERT(expectedQ == AIL_CONCAT(intFrom, tu, 16)(res.q), AIL_CONCAT(tl, DivFail), AIL_STRINGIFY(tu) "-Division", \
-                    "%d / %d = %d (expected %d) | 0x%02x / 0x%02x = 0x%02x (expected 0x%02x)", \
-                    AIL_CONCAT(intFrom, tu, 16)(a), AIL_CONCAT(intFrom, tu, 16)(b), AIL_CONCAT(intFrom, tu, 16)(res.q), expectedQ, \
-                    a, b, (u16)res.q, AIL_CONCAT(tl, FromInt16)(expectedQ)); \
-                ASSERT(expectedR == AIL_CONCAT(intFrom, tu, 16)(res.r), AIL_CONCAT(tl, DivFail), AIL_STRINGIFY(tu) "-Division", \
-                    "%d %% %d = %d (expected %d) | 0x%02x %% 0x%02x = 0x%02x (expected 0x%02x)", \
-                    AIL_CONCAT(intFrom, tu, 16)(a), AIL_CONCAT(intFrom, tu, 16)(b), AIL_CONCAT(intFrom, tu, 16)(res.r), expectedR, \
-                    a, b, (u16)res.r, AIL_CONCAT(tl, FromInt16)(expectedR)); \
-            } \
-        } \
-        printf(AIL_STRINGIFY(tu) "-Division tested successfully\n"); \
-    AIL_CONCAT(tl, DivFail): \
-        AIL_BENCH_PROFILE_END(AIL_CONCAT(test, tu, Div)); \
-    } while(0)
+bool test_div(IntFormat fmt) {
+    char buf[64];
+    snprintf(buf, ail_arrlen(buf), "%s-Division", fmt.name);
+    for (int i = -128; i <= 128; i++) {
+        for (int j = -128; j <= 128; j++) {
+            u16 a = fmt.fromInt(i);
+            u16 b = fmt.fromInt(j);
+            if (!b) continue;
+            i16 expectedQ = fmt.toInt(a) / fmt.toInt(b);
+            i16 expectedR = fmt.toInt(a) % fmt.toInt(b);
+            DivResult res = fmt.div(a, b);
+            ASSERT(expectedQ == fmt.toInt(res.q), buf, "%d / %d = %d (expected %d) | 0x%02x / 0x%02x = 0x%02x (expected 0x%02x)",
+                fmt.toInt(a), fmt.toInt(b), fmt.toInt(res.q), expectedQ, a, b, (u16)res.q, fmt.fromInt(expectedQ));
+            ASSERT(expectedR == fmt.toInt(res.r), buf, "%d %% %d = %d (expected %d) | 0x%02x %% 0x%02x = 0x%02x (expected 0x%02x)",
+                fmt.toInt(a), fmt.toInt(b), fmt.toInt(res.r), expectedR, a, b, (u16)res.r, fmt.fromInt(expectedR));
+        }
+    }
+    printf("%s tested successfully\n", buf);
+    return true;
+}
 
-#define TEST_ALL(tu, tl) do { \
-        TEST_CONV(tu, tl);    \
-        TEST_NEG(tu, tl);     \
-        TEST_ADD(tu, tl);     \
-        TEST_SUB(tu, tl);     \
-        TEST_MUL(tu, tl);     \
-        TEST_DIV(tu, tl);     \
-    } while(0)
+bool test_all(IntFormat fmt) {
+    bool res = true;
+    res &= test_conv(fmt);
+    res &= test_neg(fmt);
+    res &= test_add(fmt);
+    res &= test_sub(fmt);
+    res &= test_mul(fmt);
+    res &= test_div(fmt);
+    return res;
+}
 
 int main(void) {
 #ifdef BENCHMARK
@@ -489,8 +525,9 @@ int main(void) {
     for (int i = 0; i < BENCHMARK_COUNT; i++)
 #endif
     { // Tests
-        TEST_ALL(SignMag, signMag);
-        TEST_ALL(OnesComp, onesComp);
+        test_all(TwosComplement);
+        test_all(SignMagnitude);
+        test_all(OnesComplement);
     }
 #ifdef BENCHMARK
     printf("--------\n");

@@ -11,6 +11,9 @@
 #include "./ail/src/bench/ail_bench.h"
 #include <stdio.h>
 
+AIL_WARN_DISABLE(AIL_WARN_UNUSED_FUNCTION)
+AIL_WARN_DISABLE(AIL_WARN_UNUSED_VARIABLE)
+
 #define NOT(a) (~a)
 #define BNOT(a) (!(a))
 
@@ -212,8 +215,7 @@ global IntFormat TwosComplement = {
 // Sign Magnitude
 ///////////////////
 
-typedef u8 SignMag8;
-typedef u16 SignMag16;
+typedef u8 SignMag8; typedef u16 SignMag16;
 
 i16 signMagToInt(SignMag16 num) {
     u16 pos = SET_BIT(num, 15, 0);
@@ -307,8 +309,7 @@ global IntFormat SignMagnitude = {
 // One's Complement
 ///////////////////
 
-typedef u8 OnesComp8;
-typedef u16 OnesComp16;
+typedef u8 OnesComp8; typedef u16 OnesComp16;
 
 i16 onesCompToInt(OnesComp16 num) {
     return SELECT(GET_BIT(num, 15), twosCompAdd(num, 1), num);
@@ -331,9 +332,11 @@ OnesComp16 onesCompNeg(OnesComp16 x) {
 
 OnesComp16 onesCompAdd(OnesComp16 a, OnesComp16 b) {
     // Ripple Carry Adder
+    // If both numbers are negative, the half-adder logic would need to be inversed
+    // To prevent requiring codepaths, we can simply negate the numbers before and negate the result back at the end
     u8 both_neg = AND(GET_BIT(a, 15), GET_BIT(b, 15));
-    a = SWITCH(both_neg, onesCompNeg(a));
-    b = SWITCH(both_neg, onesCompNeg(b));
+    a = SELECT(both_neg, onesCompNeg(a), a);
+    b = SELECT(both_neg, onesCompNeg(b), b);
     u8 c = 0;
     for (int i = 0; i < 16; i++) {
         u8 ab = GET_BIT(a, i);
@@ -341,24 +344,46 @@ OnesComp16 onesCompAdd(OnesComp16 a, OnesComp16 b) {
         a = SET_BIT(a, i, BXOR(ab, bb, c));
         c = OR(AND(ab, bb), AND(c, OR(ab, bb)));
     }
-    // for (int i = 0; i < 16; i++) {
-    //     u8 ab = GET_BIT(a, i);
-    //     u8 bb = GET_BIT(b, i);
-    //     a = SET_BIT(a, i, BXOR(ab, bb, c));
-    //     c = OR(AND(ab, bb), AND(c, OR(ab, bb)));
-    // }
-    a = SWITCH(both_neg, onesCompNeg(a));
+    // Unlike with a two's complement system, we need to add a resulting carry back into the result
+    for (int i = 0; i < 16; i++) {
+        u8 ab = GET_BIT(a, i);
+        u8 bb = GET_BIT(b, i);
+        a = SET_BIT(a, i, BXOR(ab, c));
+        c = AND(ab, c);
+    }
+    a = SELECT(both_neg, onesCompNeg(a), a);
     return a;
 }
 OnesComp16 onesCompSub(OnesComp16 a, OnesComp16 b) {
     return onesCompAdd(a, onesCompNeg(b));
 }
 OnesComp16 onesCompMul(OnesComp16 a, OnesComp16 b) {
-    return twosCompMul(a, b);
+    u16 res = 0;
+    u8  an  = GET_BIT(a, 15);
+    u8  bn  = GET_BIT(b, 15);
+    a = SELECT(an, onesCompNeg(a), a);
+    b = SELECT(bn, onesCompNeg(b), b);
+    for (int i = 0; i < 16; i++) {
+        res = onesCompAdd(res, SWITCH(GET_BIT(b, i), SHIFTL(a, i)));
+    }
+    res = SELECT(BXOR(an, bn), onesCompNeg(res), res);
+    return res;
 }
 DivResult onesCompDiv(OnesComp16 a, OnesComp16 b) {
-    DivResult res = twosCompDiv(a, b);
-    return (DivResult) { .q = res.q, .r = res.r };
+    // Euclidean Division
+    u8  an   = BAND(GET_BIT(a, 15), 1);
+    u8  bn   = BAND(GET_BIT(b, 15), 1);
+    u16 num  = SELECT(an, onesCompNeg(a), a);
+    u16 den  = SELECT(bn, onesCompNeg(b), b);
+    u16 quot = 0;
+    u16 rem  = num;
+    while (BAND(rem >= den, BNOT(GET_BIT(rem, 15)))) {
+        quot = onesCompAdd(quot, 1);
+        rem  = onesCompSub(rem, den);
+    }
+    rem  = SELECT(an, onesCompNeg(rem), rem);
+    quot = SELECT(BXOR(an, bn), onesCompNeg(quot), quot);
+    return (DivResult) { .q = quot, .r = rem };
 }
 
 global IntFormat OnesComplement = {
@@ -387,7 +412,7 @@ typedef u8 BinOffset8; typedef u16 BinOffset16;
 // Base -2
 ///////////////////
 
-typedef u8 BaseNeg28;  typedef u16 BaseNeg216;
+typedef u8 BaseNeg28; typedef u16 BaseNeg216;
 
 
 ///////////////////
@@ -528,6 +553,10 @@ int main(void) {
         test_all(TwosComplement);
         test_all(SignMagnitude);
         test_all(OnesComplement);
+        // OnesComp16 a = onesCompFromInt(-5);
+        // OnesComp16 b = onesCompFromInt(7);
+        // OnesComp16 c = onesCompMul(a, b);
+        // printf("%d * %d = %d | 0x%02x * 0x%02x = 0x%02x\n", onesCompToInt(a), onesCompToInt(b), onesCompToInt(c), a, b, c);
     }
 #ifdef BENCHMARK
     printf("--------\n");

@@ -91,6 +91,7 @@ AIL_WARN_DISABLE(AIL_WARN_UNUSED_VARIABLE)
 // Abstract Format Type
 ///////////////////
 
+typedef struct { u8  x, c; } FullAddResult;
 typedef struct { u16 q, r; } DivResult;
 typedef u16 (*fromIntFunc)(i16 num);
 typedef u8  (*fromInt8Func)(i8 num);
@@ -117,10 +118,22 @@ typedef struct {
     divFunc      div;
 } IntFormat;
 
-// Utility Function
-i8 intTrunc(i16 x) {
+
+///////////////////
+// Utility Functions
+///////////////////
+
+inline_func FullAddResult fullAdder(u8 bit1, u8 bit2, u8 carry) {
+    return (FullAddResult) {
+        .x = BXOR(bit1, bit2, carry),
+        .c = OR(AND(bit1, bit2), AND(carry, BXOR(bit1, bit2))),
+    };
+}
+
+inline_func i8 intTrunc(i16 x) {
     return OR(AND(x, 0x7f), SHIFTL(GET_BIT(x, 15), 7));
 }
+
 
 
 ///////////////////
@@ -152,10 +165,9 @@ u16 twosCompAdd(u16 a, u16 b) {
     u16 res = 0;
     u8 c = 0;
     for (int i = 0; i < 16; i++) {
-        u8 ab = GET_BIT(a, i);
-        u8 bb = GET_BIT(b, i);
-        res = SET_BIT(res, i, BXOR(ab, bb, c));
-        c   = OR(AND(ab, bb), AND(c, BXOR(ab, bb)));
+        FullAddResult x = fullAdder(GET_BIT(a, i), GET_BIT(b, i), c);
+        res = SET_BIT(res, i, x.x);
+        c   = x.c;
     }
     AIL_BENCH_PROFILE_END(twosCompAdd);
     return res;
@@ -339,15 +351,13 @@ OnesComp16 onesCompAdd(OnesComp16 a, OnesComp16 b) {
     b = SELECT(both_neg, onesCompNeg(b), b);
     u8 c = 0;
     for (int i = 0; i < 16; i++) {
-        u8 ab = GET_BIT(a, i);
-        u8 bb = GET_BIT(b, i);
-        a = SET_BIT(a, i, BXOR(ab, bb, c));
-        c = OR(AND(ab, bb), AND(c, OR(ab, bb)));
+        FullAddResult x = fullAdder(GET_BIT(a, i), GET_BIT(b, i), c);
+        a = SET_BIT(a, i, x.x);
+        c = x.c;
     }
     // Unlike with a two's complement system, we need to add a resulting carry back into the result
     for (int i = 0; i < 16; i++) {
         u8 ab = GET_BIT(a, i);
-        u8 bb = GET_BIT(b, i);
         a = SET_BIT(a, i, BXOR(ab, c));
         c = AND(ab, c);
     }
@@ -405,7 +415,93 @@ global IntFormat OnesComplement = {
 // Binary Offset
 ///////////////////
 
+// @Note: The number could technically be offset by any amount.
+// Here the numbers are offset by exactly -2^8 (or^-2^16).
+// That way, a BinOffset number has the same range as the correspond Two's Complement number (0 is equal to 0x80 (or 0x8000)
 typedef u8 BinOffset8; typedef u16 BinOffset16;
+
+i16 binOffsetToInt(BinOffset16 num) {
+    return SET_BIT(num, 15, BNOT(GET_BIT(num, 15)));
+}
+BinOffset16 binOffsetFromInt(i16 num) {
+    return SET_BIT(num, 15, BNOT(GET_BIT(num, 15)));
+}
+BinOffset8 binOffsetFromInt8(i8 num) {
+    return SET_BIT(num, 7, BNOT(GET_BIT(num, 7)));
+}
+BinOffset16 binOffsetExtend(BinOffset8 num) {
+    return SELECT(GET_BIT(num, 7), OR(0x8000, AND(0x7f, num)), OR(0x7f80, num));
+}
+BinOffset8 binOffsetTrunc(BinOffset16 num) {
+    return SET_BIT(num, 7, GET_BIT(num, 15));
+}
+BinOffset16 binOffsetNeg(BinOffset16 x) {
+    // @Note: The negative range of numbers is bigger by 1 than the positive range of numbers,
+    // because there's only one 0 and it's among the positives. Therefore it is not enough to simply
+    // negate all bits, but we also need to add 1. This also has the side effect that the biggest
+    // negative number (0x0000) overflows when negated and turns back into itself when negated.
+    //   0x0000 -> 0xffff -> 0x10000 -> 0x0000
+    return twosCompAdd(NOT(x), 1);
+}
+
+BinOffset16 binOffsetAdd(BinOffset16 a, BinOffset16 b) {
+    // Ripple Carry Adder
+    u8 c = 0;
+    for (int i = 0; i < 16; i++) {
+        FullAddResult x = fullAdder(GET_BIT(a, i), GET_BIT(b, i), c);
+        a = SET_BIT(a, i, x.x);
+        c = x.c;
+    }
+    // Unlike for normal addition, the MSB must only be 1 if two of the 3 inputs to the half-adder are 1
+    // Since the carry-output c tracks exactly that, we simply set a[15] to c
+    a = SET_BIT(a, 15, c);
+    return a;
+}
+BinOffset16 binOffsetSub(BinOffset16 a, BinOffset16 b) {
+    return binOffsetAdd(a, binOffsetNeg(b));
+}
+BinOffset16 binOffsetMul(BinOffset16 a, BinOffset16 b) {
+    u16 res = 0;
+    u8  an  = BNOT(GET_BIT(a, 15));
+    u8  bn  = BNOT(GET_BIT(b, 15));
+    a = SELECT(an, binOffsetNeg(a), a);
+    b = SELECT(bn, binOffsetNeg(b), b);
+    for (int i = 0; i < 16; i++) {
+        res = binOffsetAdd(res, SWITCH(GET_BIT(b, i), SHIFTL(a, i)));
+    }
+    res = SELECT(BXOR(an, bn), binOffsetNeg(res), res);
+    return res;
+}
+DivResult binOffsetDiv(BinOffset16 a, BinOffset16 b) {
+    // Euclidean Division
+    u8  an   = BAND(GET_BIT(a, 15), 1);
+    u8  bn   = BAND(GET_BIT(b, 15), 1);
+    u16 num  = SELECT(an, binOffsetNeg(a), a);
+    u16 den  = SELECT(bn, binOffsetNeg(b), b);
+    u16 quot = 0;
+    u16 rem  = num;
+    while (BAND(rem >= den, BNOT(GET_BIT(rem, 15)))) {
+        quot = binOffsetAdd(quot, 1);
+        rem  = binOffsetSub(rem, den);
+    }
+    rem  = SELECT(an, binOffsetNeg(rem), rem);
+    quot = SELECT(BXOR(an, bn), binOffsetNeg(quot), quot);
+    return (DivResult) { .q = quot, .r = rem };
+}
+
+global IntFormat BinaryOffset = {
+    .name = "Binary Offset",
+    .fromInt  = &binOffsetFromInt,
+    .fromInt8 = &binOffsetFromInt8,
+    .toInt    = &binOffsetToInt,
+    .extend   = &binOffsetExtend,
+    .trunc    = &binOffsetTrunc,
+    .neg = &binOffsetNeg,
+    .add = &binOffsetAdd,
+    .sub = &binOffsetSub,
+    .mul = &binOffsetMul,
+    .div = &binOffsetDiv,
+};
 
 
 ///////////////////
@@ -550,13 +646,18 @@ int main(void) {
     for (int i = 0; i < BENCHMARK_COUNT; i++)
 #endif
     { // Tests
+        // i16 a = -1;
+        // printf("%d -> 0x%02x -> %d\n", a, binOffsetFromInt(a), binOffsetToInt(binOffsetFromInt(a)));
+
         test_all(TwosComplement);
         test_all(SignMagnitude);
         test_all(OnesComplement);
-        // OnesComp16 a = onesCompFromInt(-5);
-        // OnesComp16 b = onesCompFromInt(7);
-        // OnesComp16 c = onesCompMul(a, b);
-        // printf("%d * %d = %d | 0x%02x * 0x%02x = 0x%02x\n", onesCompToInt(a), onesCompToInt(b), onesCompToInt(c), a, b, c);
+        test_all(BinaryOffset);
+
+        // BinOffset16 a = binOffsetFromInt(-5);
+        // BinOffset16 b = binOffsetFromInt(7);
+        // BinOffset16 c = binOffsetMul(a, b);
+        // printf("%d * %d = %d | 0x%02x * 0x%02x = 0x%02x\n", binOffsetToInt(a), binOffsetToInt(b), binOffsetToInt(c), a, b, c);
     }
 #ifdef BENCHMARK
     printf("--------\n");
